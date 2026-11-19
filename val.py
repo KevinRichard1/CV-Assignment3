@@ -1,13 +1,15 @@
 """Evaluate or predict with a saved one-shot SigLIP energy classifier.
 
 Labelled layout (reports accuracy):
-    data/val/<class_name>/*.{jpg,png,...}
+    data/test/<class_name>/*.{jpg,png,...}
 
 Unlabelled layout (writes predictions, no accuracy is computed):
     data/test/*.{jpg,png,...}  # images may also be nested in subfolders
 
-Modes: single, multiview, adapt. In adapt mode, only a temporary copy of the
-classifier's final energy layer is updated on each unlabeled batch.
+Modes: standard, multiview, adapt. In adapt mode, only a temporary copy of the
+classifier's final energy layer is updated on each batch. When data-dir contains
+class-named subfolders matching the training folders, labels are used only to
+report evaluation metrics; they are never passed to the adaptation objective.
 """
 from __future__ import annotations
 
@@ -24,7 +26,6 @@ from tqdm import tqdm
 
 from models.adaptation import EpisodicEnergyTTA
 from models.classifier import EnergyClassifier
-from models.encoder import SigLIPEncoder
 from utils.augment import build_tta_transforms
 from utils.metrics import classification_metrics
 
@@ -60,8 +61,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--mode", choices=("single", "multiview", "adapt"), default="single")
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--mode",
+        choices=("standard", "single", "multiview", "adapt"),
+        default="standard",
+        help="standard/single: one view; multiview: average views; adapt: episodic unsupervised TTA",
+    )
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--views", type=int, default=4, help="Total views, including original")
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -119,7 +125,9 @@ def main() -> None:
     args = parse_args()
     if args.batch_size < 1 or args.temperature <= 0:
         raise ValueError("batch-size must be positive and temperature must be > 0")
-    if args.mode != "single" and args.views < 2:
+    if args.mode == "single":
+        args.mode = "standard"
+    if args.mode != "standard" and args.views < 2:
         raise ValueError("multiview/adapt mode requires --views >= 2")
 
     device = choose_device()
@@ -139,6 +147,8 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
     )
 
+    from models.encoder import SigLIPEncoder
+
     encoder = SigLIPEncoder(
         checkpoint["encoder_name"], local_files_only=args.local_files_only
     ).to(device)
@@ -152,7 +162,7 @@ def main() -> None:
     classifier.eval()
     encoder.eval()
 
-    if args.mode == "single":
+    if args.mode == "standard":
         view_transforms = [None]
     else:
         image_size = int(checkpoint["train_args"].get("image_size", 224))
@@ -220,14 +230,15 @@ def main() -> None:
         predictions_tensor = torch.cat(all_predictions)
         targets_tensor = torch.cat(all_targets)
         metrics = classification_metrics(predictions_tensor, targets_tensor, len(classes))
-        print(f"Mode: {args.mode}")
+        print(f"Evaluation mode: {args.mode}")
+        print(f"Labeled test images: {len(targets_tensor)}")
         print(f"Top-1 accuracy: {metrics['accuracy']:.4%} ({metrics['count']} images)")
         print("Per-class accuracy:")
         for class_name, accuracy in zip(classes, metrics["per_class_accuracy"]):
             value = "n/a" if accuracy != accuracy else f"{accuracy:.4%}"
             print(f"  {class_name}: {value}")
     else:
-        print(f"Predicted {len(csv_rows)} unlabelled images across {len(classes)} classes.")
+        print(f"Predicted {len(csv_rows)} images across {len(classes)} classes (no matching class labels found).")
         if args.predictions_csv is None:
             args.predictions_csv = Path("predictions.csv")
 

@@ -2,11 +2,10 @@
 
 Expected training layout:
     data/train/<class_name>/*.{jpg,png,...}
-Optional validation layout:
-    data/val/<class_name>/*.{jpg,png,...}
 
-Exactly one source image is selected per class. Augmented views are generated
-on the fly; the other source images in data/train are never loaded for training.
+Exactly one original source image is selected per class. All other source
+images under data/train are ignored. Augmented views of the selected 16 images
+are generated dynamically during training. No validation or test data is read.
 """
 from __future__ import annotations
 
@@ -23,7 +22,6 @@ from torchvision.datasets import ImageFolder
 from tqdm import tqdm
 
 from models.classifier import EnergyClassifier
-from models.encoder import SigLIPEncoder
 from utils.augment import apply_cutout, apply_mixup_cutmix, build_train_transform
 from utils.losses import energy_margin_loss
 
@@ -31,7 +29,6 @@ from utils.losses import energy_margin_loss
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-dir", type=Path, required=True)
-    parser.add_argument("--val-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("runs/oneshot_siglip"))
     parser.add_argument("--encoder-name", type=str, default="google/siglip-base-patch16-224")
     parser.add_argument("--local-files-only", action="store_true")
@@ -40,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selection-seed", type=int, default=17)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -52,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cutout-prob", type=float, default=0.0)
     parser.add_argument("--mixup-alpha", type=float, default=0.0)
     parser.add_argument("--cutmix-alpha", type=float, default=0.0)
-    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--log-every", type=int, default=1)
     return parser.parse_args()
 
 
@@ -88,7 +85,10 @@ def select_exactly_one_per_class(
             f"Expected {expected_classes} class folders, found {len(dataset.classes)}: "
             f"{dataset.classes}"
         )
-    indices_by_class: dict[int, list[int]] = {i: [] for i in range(len(dataset.classes))}
+
+    indices_by_class: dict[int, list[int]] = {
+        class_index: [] for class_index in range(len(dataset.classes))
+    }
     for index, (_, class_index) in enumerate(dataset.samples):
         indices_by_class[class_index].append(index)
 
@@ -112,40 +112,6 @@ def select_exactly_one_per_class(
     return selected_indices, manifest
 
 
-@torch.no_grad()
-def extract_embeddings(
-    encoder: SigLIPEncoder,
-    loader: DataLoader,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    all_embeddings: list[torch.Tensor] = []
-    all_labels: list[torch.Tensor] = []
-    encoder.eval()
-    for images, labels in tqdm(loader, desc="Encoding validation", leave=False):
-        pixel_values = encoder.preprocess(images).to(device, non_blocking=True)
-        all_embeddings.append(encoder(pixel_values).cpu())
-        all_labels.append(labels.cpu())
-    if not all_embeddings:
-        raise ValueError("Validation directory contains no images.")
-    return torch.cat(all_embeddings, dim=0), torch.cat(all_labels, dim=0)
-
-
-def evaluate_cached(
-    classifier: EnergyClassifier,
-    embeddings: torch.Tensor,
-    labels: torch.Tensor,
-    device: torch.device,
-) -> float:
-    classifier.eval()
-    predictions: list[torch.Tensor] = []
-    with torch.no_grad():
-        for start in range(0, embeddings.shape[0], 512):
-            batch = embeddings[start : start + 512].to(device)
-            predictions.append(classifier(batch).argmin(dim=-1).cpu())
-    predicted = torch.cat(predictions)
-    return float(predicted.eq(labels).float().mean().item())
-
-
 def save_checkpoint(
     path: Path,
     *,
@@ -156,7 +122,6 @@ def save_checkpoint(
     selected_samples: list[dict[str, str]],
     args: argparse.Namespace,
     epoch: int,
-    val_accuracy: float | None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -169,7 +134,6 @@ def save_checkpoint(
             "class_to_idx": class_to_idx,
             "selected_samples": selected_samples,
             "epoch": epoch,
-            "val_accuracy": val_accuracy,
             "train_args": vars(args),
         },
         path,
@@ -180,10 +144,14 @@ def main() -> None:
     args = parse_args()
     if args.epochs < 1 or args.batch_size < 1:
         raise ValueError("epochs and batch-size must be positive")
+    if args.num_classes < 2:
+        raise ValueError("num-classes must be at least 2")
     set_seed(args.seed)
     device = choose_device()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(device)}")
 
     train_dataset = ImageFolder(
         args.train_dir,
@@ -195,16 +163,16 @@ def main() -> None:
         expected_classes=args.num_classes,
     )
     selected_dataset = Subset(train_dataset, selected_indices)
-    # Persist the exact originals used. No other file under train-dir is loaded.
+
     manifest_path = args.output_dir / "selected_one_per_class.json"
     manifest_path.write_text(json.dumps(selected_manifest, indent=2), encoding="utf-8")
-    print(f"Selected exactly {len(selected_indices)} originals ({manifest_path})")
+    print(f"Selected exactly {len(selected_indices)} original images ({manifest_path})")
     for row in selected_manifest:
         print(f"  {row['class_name']}: {Path(row['image']).name}")
 
     train_loader = DataLoader(
         selected_dataset,
-        batch_size=args.batch_size,
+        batch_size=min(args.batch_size, len(selected_dataset)),
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
@@ -212,6 +180,8 @@ def main() -> None:
         drop_last=False,
         persistent_workers=args.num_workers > 0,
     )
+
+    from models.encoder import SigLIPEncoder
 
     encoder = SigLIPEncoder(
         args.encoder_name,
@@ -228,30 +198,10 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         classifier.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs
+    )
 
-    val_embeddings: torch.Tensor | None = None
-    val_labels: torch.Tensor | None = None
-    if args.val_dir is not None:
-        val_dataset = ImageFolder(args.val_dir, transform=None)
-        if val_dataset.class_to_idx != train_dataset.class_to_idx:
-            raise ValueError(
-                "Validation class folders must match training class folders exactly.\n"
-                f"Train: {train_dataset.class_to_idx}\nVal: {val_dataset.class_to_idx}"
-            )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=(device.type == "cuda"),
-            collate_fn=collate_pil,
-            persistent_workers=args.num_workers > 0,
-        )
-        val_embeddings, val_labels = extract_embeddings(encoder, val_loader, device)
-        print(f"Cached {len(val_labels)} validation embeddings.")
-
-    best_accuracy = -1.0
     for epoch in range(1, args.epochs + 1):
         encoder.eval()
         classifier.train()
@@ -260,13 +210,15 @@ def main() -> None:
         running_margin = 0.0
         seen = 0
 
-        progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
+        progress = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch}/{args.epochs}",
+            leave=False,
+        )
         for step, (images, labels) in enumerate(progress, start=1):
             labels = labels.to(device, non_blocking=True)
             pixel_values = encoder.preprocess(images).to(device, non_blocking=True)
-            pixel_values = apply_cutout(
-                pixel_values, probability=args.cutout_prob
-            )
+            pixel_values = apply_cutout(pixel_values, probability=args.cutout_prob)
             pixel_values, labels_a, labels_b, lam = apply_mixup_cutmix(
                 pixel_values,
                 labels,
@@ -274,6 +226,7 @@ def main() -> None:
                 cutmix_alpha=args.cutmix_alpha,
             )
 
+            # SigLIP remains frozen; only the energy classifier receives gradients.
             with torch.no_grad():
                 embeddings = encoder(pixel_values)
             energies = classifier(embeddings)
@@ -292,11 +245,11 @@ def main() -> None:
             nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=5.0)
             optimizer.step()
 
-            batch_size = labels.shape[0]
-            running_loss += float(loss.detach().item()) * batch_size
-            running_ce += float(loss_parts["ce"].item()) * batch_size
-            running_margin += float(loss_parts["margin"].item()) * batch_size
-            seen += batch_size
+            current_batch = labels.shape[0]
+            running_loss += float(loss.detach().item()) * current_batch
+            running_ce += float(loss_parts["ce"].item()) * current_batch
+            running_margin += float(loss_parts["margin"].item()) * current_batch
+            seen += current_batch
             if args.log_every > 0 and step % args.log_every == 0:
                 progress.set_postfix(
                     loss=f"{running_loss / max(seen, 1):.4f}",
@@ -305,35 +258,17 @@ def main() -> None:
                 )
 
         scheduler.step()
-        train_loss = running_loss / max(seen, 1)
-        val_accuracy = None
-        if val_embeddings is not None and val_labels is not None:
-            val_accuracy = evaluate_cached(classifier, val_embeddings, val_labels, device)
-            print(
-                f"Epoch {epoch:03d}: loss={train_loss:.5f}, "
-                f"val_acc={val_accuracy:.4%}, lr={scheduler.get_last_lr()[0]:.2e}"
-            )
-            if val_accuracy > best_accuracy:
-                best_accuracy = val_accuracy
-                save_checkpoint(
-                    args.output_dir / "best.pt",
-                    classifier=classifier,
-                    encoder_name=args.encoder_name,
-                    classes=train_dataset.classes,
-                    class_to_idx=train_dataset.class_to_idx,
-                    selected_samples=selected_manifest,
-                    args=args,
-                    epoch=epoch,
-                    val_accuracy=val_accuracy,
-                )
-        else:
-            print(
-                f"Epoch {epoch:03d}: loss={train_loss:.5f}, "
-                f"lr={scheduler.get_last_lr()[0]:.2e}"
-            )
+        print(
+            f"Epoch {epoch:03d}/{args.epochs}: "
+            f"loss={running_loss / max(seen, 1):.5f}, "
+            f"ce={running_ce / max(seen, 1):.5f}, "
+            f"margin={running_margin / max(seen, 1):.5f}, "
+            f"lr={scheduler.get_last_lr()[0]:.2e}"
+        )
 
+    final_path = args.output_dir / "final.pt"
     save_checkpoint(
-        args.output_dir / "last.pt",
+        final_path,
         classifier=classifier,
         encoder_name=args.encoder_name,
         classes=train_dataset.classes,
@@ -341,12 +276,9 @@ def main() -> None:
         selected_samples=selected_manifest,
         args=args,
         epoch=args.epochs,
-        val_accuracy=best_accuracy if best_accuracy >= 0 else None,
     )
-    if best_accuracy >= 0:
-        print(f"Best validation accuracy: {best_accuracy:.4%}")
-        print(f"Best checkpoint: {args.output_dir / 'best.pt'}")
-    print(f"Last checkpoint: {args.output_dir / 'last.pt'}")
+    print(f"Final checkpoint: {final_path}")
+    print(f"Selected-example manifest: {manifest_path}")
 
 
 if __name__ == "__main__":
