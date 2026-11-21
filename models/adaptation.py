@@ -1,19 +1,19 @@
-"""Optional episodic test-time adaptation of the energy head."""
+"""Optional episodic test-time adaptation of a conventional classifier head."""
 from __future__ import annotations
 
 from copy import deepcopy
 
 import torch
-import torch.nn.functional as F
 
-from .classifier import EnergyClassifier
+from .classifier import MLPClassifier
 
 
-class EpisodicEnergyTTA:
-    """Adapt a temporary copy of the final energy layer on an unlabeled batch.
+class EpisodicClassifierTTA:
+    """Adapt a temporary copy of the final classification layer on an unlabeled batch.
 
     The SigLIP encoder is not touched. Adaptation is reset for every batch so
-    predictions do not depend on the order of earlier test batches.
+    updates do not accumulate across the test set. Only image embeddings are
+    accepted; labels, paths, and class-folder information are never used.
     """
 
     def __init__(
@@ -35,33 +35,30 @@ class EpisodicEnergyTTA:
     @torch.enable_grad()
     def adapt_and_predict(
         self,
-        classifier: EnergyClassifier,
+        classifier: MLPClassifier,
         view_embeddings: torch.Tensor,
-    ) -> tuple[torch.Tensor, EnergyClassifier]:
-        """Return mean per-view probabilities and the temporary adapted head.
+    ) -> tuple[torch.Tensor, MLPClassifier]:
+        """Return mean per-view probabilities and the temporary adapted MLP.
 
         Args:
-            classifier: trained classifier, left unchanged.
-            view_embeddings: [num_views, batch, embedding_dim].
+            classifier: trained classifier, which is left unchanged.
+            view_embeddings: tensor shaped [num_views, batch, embedding_dim].
         """
         if view_embeddings.ndim != 3:
             raise ValueError("view_embeddings must have shape [views, batch, embedding_dim]")
         if view_embeddings.shape[0] < 1:
             raise ValueError("At least one view is required")
 
-        base = classifier
         adapted = deepcopy(classifier)
-        adapted.freeze_except_energy_head()
-        # Keep dropout disabled during adaptation; gradients still flow to the
-        # explicitly unfrozen final energy layer while behavior stays stable.
-        adapted.eval()
+        adapted.freeze_except_head()
+        adapted.eval()  # Disable dropout; gradients still update the trainable head.
 
-        # Teacher probabilities from the unadapted checkpoint.
         with torch.no_grad():
-            base_energies = torch.stack(
-                [base(view_embeddings[v]) for v in range(view_embeddings.shape[0])], dim=0
+            base_logits = torch.stack(
+                [classifier(view_embeddings[v]) for v in range(view_embeddings.shape[0])],
+                dim=0,
             )
-            teacher_probs = torch.softmax(-base_energies / self.temperature, dim=-1)
+            teacher_probs = torch.softmax(base_logits / self.temperature, dim=-1)
 
         if self.steps > 0:
             optimizer = torch.optim.AdamW(
@@ -70,22 +67,25 @@ class EpisodicEnergyTTA:
                 weight_decay=1e-3,
             )
             for _ in range(self.steps):
-                energies = torch.stack(
+                logits = torch.stack(
                     [adapted(view_embeddings[v]) for v in range(view_embeddings.shape[0])],
                     dim=0,
                 )
-                probabilities = torch.softmax(-energies / self.temperature, dim=-1)
+                probabilities = torch.softmax(logits / self.temperature, dim=-1)
                 mean_probabilities = probabilities.mean(dim=0)
 
-                # Per-image entropy (not entropy of the batch class histogram).
+                # Per-image entropy, not entropy of the batch class histogram.
                 entropy = -(
-                    mean_probabilities * mean_probabilities.clamp_min(1e-8).log()
+                    mean_probabilities
+                    * mean_probabilities.clamp_min(1e-8).log()
                 ).sum(dim=-1).mean()
 
-                # Encourage different views of the same image to agree.
-                consistency = (probabilities - mean_probabilities.unsqueeze(0)).square().mean()
+                # Encourage multiple views of each image to agree.
+                consistency = (
+                    probabilities - mean_probabilities.unsqueeze(0)
+                ).square().mean()
 
-                # Keep adaptation near the original model's predictions.
+                # Keep predictions close to the unadapted classifier.
                 log_probabilities = probabilities.clamp_min(1e-8).log()
                 anchor = (
                     teacher_probs
@@ -103,10 +103,11 @@ class EpisodicEnergyTTA:
 
         adapted.eval()
         with torch.no_grad():
-            final_energies = torch.stack(
-                [adapted(view_embeddings[v]) for v in range(view_embeddings.shape[0])], dim=0
+            final_logits = torch.stack(
+                [adapted(view_embeddings[v]) for v in range(view_embeddings.shape[0])],
+                dim=0,
             )
             final_probabilities = torch.softmax(
-                -final_energies / self.temperature, dim=-1
+                final_logits / self.temperature, dim=-1
             ).mean(dim=0)
         return final_probabilities, adapted

@@ -1,13 +1,15 @@
-"""Small discriminative energy head for frozen SigLIP embeddings."""
+"""Conventional MLP classifier for frozen SigLIP image embeddings."""
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-class EnergyClassifier(nn.Module):
-    """Map an image embedding to one energy per class (lower is better).
+class MLPClassifier(nn.Module):
+    """Map a SigLIP image embedding to one class logit per target class.
+
+    The outputs are ordinary classification logits. Higher logits indicate
+    greater compatibility with a class; train with cross-entropy loss.
     """
 
     def __init__(
@@ -19,7 +21,12 @@ class EnergyClassifier(nn.Module):
     ) -> None:
         super().__init__()
         if embedding_dim <= 0 or num_classes < 2 or hidden_dim <= 0:
-            raise ValueError("embedding_dim/hidden_dim must be positive and num_classes >= 2")
+            raise ValueError(
+                "embedding_dim and hidden_dim must be positive; num_classes must be >= 2"
+            )
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+
         self.embedding_dim = int(embedding_dim)
         self.num_classes = int(num_classes)
 
@@ -27,13 +34,10 @@ class EnergyClassifier(nn.Module):
         self.hidden = nn.Linear(self.embedding_dim, hidden_dim)
         self.activation = nn.GELU()
         self.dropout = nn.Dropout(dropout)
-        self.energy_head = nn.Linear(hidden_dim, self.num_classes)
-
-        # Small initial energies help keep early softmax gradients well-scaled.
-        nn.init.normal_(self.energy_head.weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.energy_head.bias)
+        self.head = nn.Linear(hidden_dim, self.num_classes)
 
     def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Return logits with shape [batch, num_classes]."""
         if embeddings.ndim != 2 or embeddings.shape[-1] != self.embedding_dim:
             raise ValueError(
                 f"Expected embeddings [B, {self.embedding_dim}], got {tuple(embeddings.shape)}"
@@ -42,21 +46,25 @@ class EnergyClassifier(nn.Module):
         x = self.hidden(x)
         x = self.activation(x)
         x = self.dropout(x)
-        return self.energy_head(x)
+        return self.head(x)
 
-    def probabilities(self, embeddings: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    def probabilities(
+        self,
+        embeddings: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Convert logits to probabilities; higher logits mean higher probability."""
         if temperature <= 0:
             raise ValueError("temperature must be > 0")
-        energies = self(embeddings)
-        return torch.softmax(-energies / temperature, dim=-1)
+        return torch.softmax(self(embeddings) / temperature, dim=-1)
 
     @staticmethod
-    def predict_from_energies(energies: torch.Tensor) -> torch.Tensor:
-        return energies.argmin(dim=-1)
+    def predict_from_logits(logits: torch.Tensor) -> torch.Tensor:
+        return logits.argmax(dim=-1)
 
-    def freeze_except_energy_head(self) -> None:
-        """For TTA, unfreeze only the final class-energy linear layer."""
+    def freeze_except_head(self) -> None:
+        """For optional TTA, update only the final classification layer."""
         for parameter in self.parameters():
             parameter.requires_grad_(False)
-        for parameter in self.energy_head.parameters():
+        for parameter in self.head.parameters():
             parameter.requires_grad_(True)

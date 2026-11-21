@@ -1,4 +1,4 @@
-"""Train a one-shot SigLIP + discriminative energy classifier.
+"""Train a one-shot SigLIP + conventional MLP classifier.
 
 Expected training layout:
     data/train/<class_name>/*.{jpg,png,...}
@@ -21,9 +21,9 @@ from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import ImageFolder
 from tqdm import tqdm
 
-from models.classifier import EnergyClassifier
+from models.classifier import MLPClassifier
 from utils.augment import apply_cutout, apply_mixup_cutmix, build_train_transform
-from utils.losses import energy_margin_loss
+from utils.losses import classification_loss
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,9 +43,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
-    parser.add_argument("--margin", type=float, default=0.5)
-    parser.add_argument("--margin-weight", type=float, default=0.1)
-    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cutout-prob", type=float, default=0.0)
     parser.add_argument("--mixup-alpha", type=float, default=0.0)
     parser.add_argument("--cutmix-alpha", type=float, default=0.0)
@@ -115,7 +112,7 @@ def select_exactly_one_per_class(
 def save_checkpoint(
     path: Path,
     *,
-    classifier: EnergyClassifier,
+    classifier: MLPClassifier,
     encoder_name: str,
     classes: list[str],
     class_to_idx: dict[str, int],
@@ -153,6 +150,8 @@ def main() -> None:
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(device)}")
 
+    # The transform is applied only after a single source image per class has
+    # been selected. No other file in a class folder enters the training loop.
     train_dataset = ImageFolder(
         args.train_dir,
         transform=build_train_transform(args.image_size),
@@ -188,7 +187,7 @@ def main() -> None:
         local_files_only=args.local_files_only,
     ).to(device)
     encoder.eval()
-    classifier = EnergyClassifier(
+    classifier = MLPClassifier(
         embedding_dim=encoder.embedding_dim,
         num_classes=args.num_classes,
         hidden_dim=args.hidden_dim,
@@ -206,8 +205,6 @@ def main() -> None:
         encoder.eval()
         classifier.train()
         running_loss = 0.0
-        running_ce = 0.0
-        running_margin = 0.0
         seen = 0
 
         progress = tqdm(
@@ -226,19 +223,11 @@ def main() -> None:
                 cutmix_alpha=args.cutmix_alpha,
             )
 
-            # SigLIP remains frozen; only the energy classifier receives gradients.
+            # SigLIP remains frozen; only the MLP classifier receives gradients.
             with torch.no_grad():
                 embeddings = encoder(pixel_values)
-            energies = classifier(embeddings)
-            loss, loss_parts = energy_margin_loss(
-                energies,
-                labels_a,
-                labels_b,
-                lam,
-                temperature=args.temperature,
-                margin=args.margin,
-                margin_weight=args.margin_weight,
-            )
+            logits = classifier(embeddings)
+            loss = classification_loss(logits, labels_a, labels_b, lam)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -247,25 +236,20 @@ def main() -> None:
 
             current_batch = labels.shape[0]
             running_loss += float(loss.detach().item()) * current_batch
-            running_ce += float(loss_parts["ce"].item()) * current_batch
-            running_margin += float(loss_parts["margin"].item()) * current_batch
             seen += current_batch
             if args.log_every > 0 and step % args.log_every == 0:
                 progress.set_postfix(
                     loss=f"{running_loss / max(seen, 1):.4f}",
-                    ce=f"{running_ce / max(seen, 1):.4f}",
-                    margin=f"{running_margin / max(seen, 1):.4f}",
                 )
 
         scheduler.step()
         print(
             f"Epoch {epoch:03d}/{args.epochs}: "
             f"loss={running_loss / max(seen, 1):.5f}, "
-            f"ce={running_ce / max(seen, 1):.5f}, "
-            f"margin={running_margin / max(seen, 1):.5f}, "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
 
+    # No validation split is assumed. Save the final fixed-epoch model.
     final_path = args.output_dir / "final.pt"
     save_checkpoint(
         final_path,

@@ -1,4 +1,4 @@
-"""Evaluate or predict with a saved one-shot SigLIP energy classifier.
+"""Evaluate or predict with a saved one-shot SigLIP MLP classifier.
 
 Labelled layout (reports accuracy):
     data/test/<class_name>/*.{jpg,png,...}
@@ -7,7 +7,7 @@ Unlabelled layout (writes predictions, no accuracy is computed):
     data/test/*.{jpg,png,...}  # images may also be nested in subfolders
 
 Modes: standard, multiview, adapt. In adapt mode, only a temporary copy of the
-classifier's final energy layer is updated on each batch. When data-dir contains
+classifier's final classification layer is updated on each batch. When data-dir contains
 class-named subfolders matching the training folders, labels are used only to
 report evaluation metrics; they are never passed to the adaptation objective.
 """
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import random
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +25,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import ImageFolder
 from tqdm import tqdm
 
-from models.adaptation import EpisodicEnergyTTA
-from models.classifier import EnergyClassifier
+from models.adaptation import EpisodicClassifierTTA
+from models.classifier import MLPClassifier
 from utils.augment import build_tta_transforms
 from utils.metrics import classification_metrics
 
@@ -69,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42, help="Seed for test ordering and stochastic TTA views")
     parser.add_argument("--views", type=int, default=4, help="Total views, including original")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--tta-steps", type=int, default=5)
@@ -78,6 +80,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictions-csv", type=Path, default=None)
     parser.add_argument("--local-files-only", action="store_true")
     return parser.parse_args()
+
+
+def seed_everything(seed: int) -> torch.Generator:
+    """Seed stochastic TTA and return a dedicated DataLoader RNG.
+
+    The sampler RNG is separate from the augmentation RNG, so changes in the
+    number of random transforms do not silently change the test-set permutation.
+    """
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
 
 
 def choose_device() -> torch.device:
@@ -130,6 +147,8 @@ def main() -> None:
     if args.mode != "standard" and args.views < 2:
         raise ValueError("multiview/adapt mode requires --views >= 2")
 
+    loader_generator = seed_everything(args.seed)
+
     device = choose_device()
     checkpoint = load_checkpoint(args.checkpoint, device)
     classes = list(checkpoint["classes"])
@@ -137,10 +156,16 @@ def main() -> None:
     if is_labelled and dataset.class_to_idx != checkpoint.get("class_to_idx", dataset.class_to_idx):
         raise ValueError("Evaluation class indices do not match the checkpoint.")
 
+    # ImageFolder enumerates samples in class-folder order. For adaptive TTA,
+    # randomize indices across the ENTIRE dataset before forming batches. The
+    # sampler uses only dataset length and a seeded RNG; it never reads labels,
+    # class names, or paths. Standard/multiview inference does not need shuffling.
+    adaptive_order = args.mode == "adapt"
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        shuffle=adaptive_order,
+        generator=loader_generator,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
         collate_fn=collate_images,
@@ -152,7 +177,7 @@ def main() -> None:
     encoder = SigLIPEncoder(
         checkpoint["encoder_name"], local_files_only=args.local_files_only
     ).to(device)
-    classifier = EnergyClassifier(
+    classifier = MLPClassifier(
         embedding_dim=int(checkpoint["embedding_dim"]),
         num_classes=int(checkpoint["num_classes"]),
         hidden_dim=int(checkpoint["train_args"].get("hidden_dim", 512)),
@@ -168,7 +193,13 @@ def main() -> None:
         image_size = int(checkpoint["train_args"].get("image_size", 224))
         view_transforms = build_tta_transforms(image_size=image_size, views=args.views)
 
-    adapter = EpisodicEnergyTTA(
+    if adaptive_order:
+        print(
+            f"Adaptive TTA: randomized full-dataset order (seed={args.seed}); "
+            "adaptation receives image embeddings only, never labels or paths."
+        )
+
+    adapter = EpisodicClassifierTTA(
         steps=args.tta_steps,
         learning_rate=args.tta_lr,
         temperature=args.temperature,
